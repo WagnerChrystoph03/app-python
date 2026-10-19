@@ -1,0 +1,581 @@
+import random
+import time
+import pickle
+import tkinter as tk
+from tkinter import messagebox, simpledialog
+
+# ---------------- Constantes ----------------
+RANK_FILE  = "rank.pickle"
+MAX_RANK   = 5
+
+# ---------------- Paleta ----------------
+BG_DARK    = "#0d1117"
+BG_CARD    = "#161b22"
+BG_INPUT   = "#0d1117"
+BORDER     = "#30363d"
+
+FG_MAIN    = "#e6edf3"
+FG_MUTED   = "#8b949e"
+
+ACCENT     = "#2ea043"
+ACCENT_HOV = "#3fb950"
+DANGER     = "#1b6f77"
+DANGER_1     = "#8E0505"
+DANGER_HOV = "#1b6f77"
+INFO       = "#1f6feb"
+INFO_HOV   = "#388bfd"
+WARN       = "#f0883e"
+GOLD       = "#e3b341"
+AJUDA      = "#d29922"
+AJUDA_HOV  = "#e3b341"
+
+FONT_TITLE = ("Segoe UI", 18, "bold")
+FONT_SUB   = ("Segoe UI", 10)
+FONT_BODY  = ("Segoe UI", 11)
+FONT_MONO  = ("Consolas", 10)
+FONT_ENTRY = ("Consolas", 28, "bold")
+FONT_BTN   = ("Segoe UI", 11, "bold")
+
+# ---------------- Níveis de dificuldade ----------------
+# (nome, quantidade de dígitos, cor do badge)
+DIFFICULTIES = [
+    ("Fácil",    3, ACCENT),
+    ("Moderado", 4, INFO),
+    ("Difícil",  5, WARN),
+    ("Insano",   6, DANGER_1),
+]
+DIF_ORDER = {nome: i for i, (nome, _, _) in enumerate(DIFFICULTIES)}
+
+
+def _regras_texto(num_digits, dif_nome):
+    return (
+        "REGRAS PARA O JOGADOR\n"
+        f"\n   1. O Algoritmo irá escolher, aleatoriamente, um número formado por "
+        f"{num_digits} algarismos distintos (dificuldade atual: {dif_nome})."
+        "\n   2. O usuário deverá adivinhar o número escolhido informando um número, "
+        "a cada tentativa."
+        "\n   3. O sistema deverá informar, após cada tentativa, quantos algarismos "
+        "o usuário acertou e quantos estão na posição correta."
+        "\n   4. O jogo termina quando o usuário acerta o número escolhido pelo "
+        "sistema ou quando desiste."
+        "\n\nDIFICULDADE 🎚:"
+        "\n   Fácil (3 dígitos) · Moderado (4 dígitos) · Difícil (5 dígitos) · "
+        "Insano (6 dígitos). Mudar a dificuldade reinicia a partida."
+        "\n\nAJUDA 💡:"
+        "\n   Uma vez por partida, o jogador pode pedir uma ajuda que revela um "
+        "único algarismo presente no número secreto (sem informar a posição). "
+        "Cada ajuda custa +1 tentativa."
+        "\n\nARBITRAGEM:"
+        "\n   Serão contabilizadas as quantidades de tentativas realizadas e o "
+        "tempo gasto pelo usuário para acertar o número da sorte."
+        "\n   O ranking é ordenado por dificuldade (mais difícil primeiro) e, "
+        "em seguida, por tentativas e tempo."
+    )
+
+
+# ---------------- Helpers ----------------
+def make_button(parent, text, command, bg, hover_bg, fg="white",
+                font=None, padx=18, pady=8):
+    btn = tk.Button(
+        parent, text=text, command=command,
+        bg=bg, fg=fg,
+        activebackground=hover_bg, activeforeground=fg,
+        font=font or FONT_BTN,
+        relief="flat", bd=0, padx=padx, pady=pady,
+        cursor="hand2", highlightthickness=0,
+    )
+    btn.bind("<Enter>", lambda e: btn.config(bg=hover_bg))
+    btn.bind("<Leave>", lambda e: btn.config(bg=bg))
+    return btn
+
+
+def make_card(parent):
+    outer = tk.Frame(parent, bg=BORDER)
+    inner = tk.Frame(outer, bg=BG_CARD)
+    inner.pack(fill="both", expand=True, padx=1, pady=1)
+    return outer, inner
+
+
+class Jogo:
+    def __init__(self):
+        # dificuldade (índice em DIFFICULTIES)
+        self.dificuldade_idx  = 1               # Moderado
+        self.num_digits       = DIFFICULTIES[self.dificuldade_idx][1]
+        self._updating_slider = False
+
+        self.rank            = self._carregar_rank()
+        self.numero_secreto  = []
+        self.tentativas      = 0
+        self.tempo_inicio    = 0.0
+        self._finalizada     = False
+        self.ajuda_usada     = False
+
+        self.root = tk.Tk()
+        self.root.title("THE MADNESS GAME - GUESSING N PLAY")
+        self.root.configure(bg=BG_DARK)
+        self.root.minsize(740, 720)
+
+        self._centralizar(820, 760)
+        self.root.bind("<Escape>", lambda e: self._desistir())
+
+        self.container = tk.Frame(self.root, bg=BG_DARK)
+        self.container.pack(fill="both", expand=True, padx=24, pady=24)
+
+        self._iniciar_partida()
+        self.root.mainloop()
+
+    def _centralizar(self, w, h):
+        self.root.update_idletasks()
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        self.root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+    # ---------------- Persistência ----------------
+    def _carregar_rank(self):
+        try:
+            with open(RANK_FILE, "rb") as f:
+                dados = pickle.load(f)
+        except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+            return []
+        # normaliza formato antigo (3-tuplas) -> (nome, tent, tempo, dificuldade)
+        out = []
+        for it in dados:
+            if len(it) == 4:
+                out.append(tuple(it))
+            elif len(it) == 3:
+                out.append((it[0], it[1], it[2], "Moderado"))
+        return out
+
+    def _salvar_rank(self):
+        with open(RANK_FILE, "wb") as f:
+            pickle.dump(self.rank, f)
+
+    # ---------------- Lógica ----------------
+    def _gerar_numero_secreto(self):
+        a=random.sample(range(10), self.num_digits)
+        """print(a)  este comando imprime o numero sorteado, para testar o app apague as aspas e este texto"""
+        return a
+        
+    def _validar_palpite(self, texto):
+        if not texto.isdigit() or len(texto) != self.num_digits:
+            return None
+        palpite = [int(d) for d in texto]
+        if len(set(palpite)) != self.num_digits:
+            return None
+        return palpite
+
+    def _verificar_tentativa(self, tentativa):
+        acertos  = sum(d in self.numero_secreto for d in tentativa)
+        posicoes = sum(d == s for d, s in zip(tentativa, self.numero_secreto))
+        return acertos, posicoes
+
+    def _atualizar_rank(self, tentativas, tempo):
+        nome = simpledialog.askstring(
+            "Ranking", "Digite seu nome para o ranking:", parent=self.root
+        )
+        if not nome:
+            return
+        dif_nome = DIFFICULTIES[self.dificuldade_idx][0]
+        self.rank.append((nome.strip(), tentativas, tempo, dif_nome))
+        self.rank.sort(key=lambda x: (-DIF_ORDER.get(x[3], 1), x[1], x[2]))
+        self.rank = self.rank[:MAX_RANK]
+        self._salvar_rank()
+
+    # ---------------- Navegação ----------------
+    def _limpar(self):
+        for w in self.container.winfo_children():
+            w.destroy()
+
+    def _iniciar_partida(self):
+        self._limpar()
+        self.numero_secreto = self._gerar_numero_secreto()
+        self.tentativas      = 0
+        self.tempo_inicio    = time.time()
+        self._finalizada     = False
+        self.ajuda_usada     = False
+        self._construir_tela_jogo()
+
+    # ---------------- Slider ----------------
+    def _on_slider(self, value):
+        if self._updating_slider:
+            return
+
+        idx = int(round(float(value)))
+        if idx == self.dificuldade_idx:
+            return
+
+        # se a partida já terminou, ignora (volta à posição atual)
+        if self._finalizada:
+            self._updating_slider = True
+            self.slider.set(self.dificuldade_idx)
+            self._updating_slider = False
+            return
+
+        # se já houve palpite/ajuda, confirma reinício
+        if self.tentativas > 0:
+            resp = messagebox.askyesno(
+                "Mudar dificuldade",
+                "Mudar a dificuldade vai reiniciar a partida atual.\n"
+                "Deseja continuar?",
+                parent=self.root,
+            )
+            if not resp:
+                self._updating_slider = True
+                self.slider.set(self.dificuldade_idx)
+                self._updating_slider = False
+                return
+
+        self.dificuldade_idx = idx
+        self.num_digits      = DIFFICULTIES[idx][1]
+        # deferido para não destruir o slider dentro do próprio callback
+        self.root.after(1, self._iniciar_partida)
+
+    # ---------------- Tela principal ----------------
+    def _construir_tela_jogo(self):
+        outer, card = make_card(self.container)
+        outer.pack(fill="both", expand=True)
+
+        # Cabeçalho
+        header = tk.Frame(card, bg=BG_CARD)
+        header.pack(fill="x", padx=24, pady=(20, 4))
+
+        tk.Label(
+            header, text="JOGO DU TRIGUINHU - GUESSING N PLAY",
+            fg=FG_MAIN, bg=BG_CARD, font=FONT_TITLE,
+        ).pack(side="left")
+
+        make_button(
+            header, "Regras", self._mostrar_regras,
+            bg=INFO, hover_bg=INFO_HOV,
+            font=("Segoe UI", 10, "bold"), padx=14, pady=6,
+        ).pack(side="right")
+
+        tk.Label(
+            card,
+            text=f"Adivinhe o número secreto de {self.num_digits} dígitos distintos.",
+            fg=FG_MUTED, bg=BG_CARD, font=FONT_SUB,
+        ).pack(anchor="w", padx=24, pady=(0, 12))
+
+        # ---- Linha do slider de dificuldade ----
+        dif_row = tk.Frame(card, bg=BG_CARD)
+        dif_row.pack(fill="x", padx=24, pady=(0, 14))
+
+        tk.Label(
+            dif_row, text="DIFICULDADE",
+            fg=FG_MUTED, bg=BG_CARD, font=("Segoe UI", 9, "bold"),
+        ).pack(side="left")
+
+        self.slider = tk.Scale(
+            dif_row,
+            from_=0, to=len(DIFFICULTIES) - 1,
+            orient="horizontal",
+            showvalue=0,
+            resolution=1,
+            length=260,
+            sliderlength=22,
+            width=14,
+            bg=BG_CARD,
+            fg=FG_MAIN,
+            troughcolor=BG_INPUT,
+            activebackground=DIFFICULTIES[self.dificuldade_idx][2],
+            highlightthickness=0,
+            bd=0,
+            command=self._on_slider,
+        )
+        self.slider.pack(side="left", padx=(12, 0))
+
+        # sincroniza valor sem disparar o callback
+        self._updating_slider = True
+        self.slider.set(self.dificuldade_idx)
+        self._updating_slider = False
+
+        cor_dif = DIFFICULTIES[self.dificuldade_idx][2]
+        self.lbl_dif = tk.Label(
+            dif_row,
+            text=f"{DIFFICULTIES[self.dificuldade_idx][0]}  ·  "
+                 f"{self.num_digits} dígitos",
+            fg=cor_dif, bg=BG_CARD, font=("Segoe UI", 11, "bold"),
+        )
+        self.lbl_dif.pack(side="left", padx=(14, 0))
+
+        # separador
+        tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=24)
+
+        # Área de input
+        input_area = tk.Frame(card, bg=BG_CARD)
+        input_area.pack(fill="x", padx=24, pady=(22, 6))
+
+        tk.Label(
+            input_area, text="SEU PALPITE",
+            fg=FG_MUTED, bg=BG_CARD, font=("Segoe UI", 9, "bold"),
+        ).pack(anchor="w")
+
+        entry_wrap = tk.Frame(input_area, bg=BORDER)
+        entry_wrap.pack(fill="x", pady=(6, 0))
+
+        vcmd = (self.root.register(
+            lambda p: p == "" or (p.isdigit() and len(p) <= self.num_digits)
+        ), "%P")
+
+        self.entry = tk.Entry(
+            entry_wrap,
+            font=FONT_ENTRY,
+            bg=BG_INPUT, fg=FG_MAIN,
+            insertbackground=FG_MAIN,
+            justify="center",
+            relief="flat", bd=0,
+            validate="key", validatecommand=vcmd,
+            highlightthickness=0,
+        )
+        self.entry.pack(fill="x", padx=2, pady=2, ipady=8)
+        self.entry.focus_set()
+        self.entry.bind("<Return>", lambda e: self._adivinhar())
+
+        # Resultado
+        self.lbl_resultado = tk.Label(
+            card, text="Aguardando seu primeiro palpite...",
+            fg=FG_MUTED, bg=BG_CARD, font=FONT_BODY,
+        )
+        self.lbl_resultado.pack(pady=(16, 8))
+
+        # Histórico
+        hist_wrap = tk.Frame(card, bg=BORDER)
+        hist_wrap.pack(fill="both", expand=True, padx=24, pady=(4, 4))
+
+        self.txt_historico = tk.Text(
+            hist_wrap, height=10, wrap="word",
+            bg=BG_INPUT, fg=FG_MAIN,
+            font=FONT_MONO, relief="flat", bd=0,
+            padx=10, pady=8, highlightthickness=0,
+            state="disabled", cursor="arrow",
+        )
+        self.txt_historico.pack(fill="both", expand=True, padx=2, pady=2)
+
+        self.txt_historico.tag_config("win",   foreground=ACCENT)
+        self.txt_historico.tag_config("miss",  foreground=WARN)
+        self.txt_historico.tag_config("info",  foreground=AJUDA_HOV)
+        self.txt_historico.tag_config("lose",  foreground=DANGER)
+
+        # Botões
+        botoes = tk.Frame(card, bg=BG_CARD)
+        botoes.pack(fill="x", padx=24, pady=20)
+
+        make_button(
+            botoes, "🍀  Adivinhar",
+            self._adivinhar,
+            bg=ACCENT, hover_bg=ACCENT_HOV,
+        ).pack(side="left")
+
+        self.btn_ajuda = make_button(
+            botoes, "💡  Ajuda",
+            self._pedir_ajuda,
+            bg=AJUDA, hover_bg=AJUDA_HOV,
+        )
+        self.btn_ajuda.pack(side="left", padx=(10, 0))
+
+        make_button(
+            botoes, "Desistir  ಥ_ಥ",
+            self._desistir,
+            bg=DANGER, hover_bg=DANGER_HOV,
+        ).pack(side="right")
+
+    # ---------------- Histórico ----------------
+    def _log(self, msg, tag=None):
+        self.txt_historico.config(state="normal")
+        self.txt_historico.insert("end", msg + "\n", tag or ())
+        self.txt_historico.see("end")
+        self.txt_historico.config(state="disabled")
+
+    # ---------------- Ações ----------------
+    def _mostrar_regras(self):
+        dif_nome = DIFFICULTIES[self.dificuldade_idx][0]
+        messagebox.showinfo(
+            "Regras",
+            _regras_texto(self.num_digits, dif_nome),
+            parent=self.root,
+        )
+
+    def _set_resultado(self, texto, cor):
+        self.lbl_resultado.config(text=texto, fg=cor)
+
+    def _pedir_ajuda(self):
+        if self._finalizada:
+            return
+        if self.ajuda_usada:
+            self._set_resultado("⚠  Você já usou sua ajuda nesta partida.", WARN)
+            return
+
+        digito = random.choice(self.numero_secreto)
+        self.ajuda_usada = True
+        self.tentativas += 1
+
+        self.btn_ajuda.config(
+            state="disabled",
+            bg="#21262d", disabledforeground=FG_MUTED, cursor="arrow",
+        )
+        self.btn_ajuda.unbind("<Enter>")
+        self.btn_ajuda.unbind("<Leave>")
+
+        self._set_resultado(
+            f"💡  Dica: o algarismo  {digito}  está no número secreto.  "
+            f"(+1 tentativa)",
+            AJUDA,
+        )
+        self._log(
+            f"#{self.tentativas:<2} 💡 ajuda  ->  um dos algarismos é {digito}",
+            "info",
+        )
+        self.entry.focus_set()
+
+    def _adivinhar(self):
+        if self._finalizada:
+            return
+
+        texto   = self.entry.get().strip()
+        palpite = self._validar_palpite(texto)
+
+        if palpite is None:
+            self._set_resultado(
+                f"⚠  Digite {self.num_digits} dígitos distintos.", WARN
+            )
+            self.entry.focus_set()
+            return
+
+        self.entry.delete(0, "end")
+        self.tentativas += 1
+        acertos, posicoes = self._verificar_tentativa(palpite)
+
+        if palpite == self.numero_secreto:
+            tempo = round(time.time() - self.tempo_inicio, 2)
+            self._set_resultado(
+                f"🎉  Acertou em {self.tentativas} tentativa(s) e {tempo}s!",
+                ACCENT,
+            )
+            self._log(
+                f"#{self.tentativas:<2} {texto}  ->  ✔ ACERTOU!   ({tempo}s)",
+                "win",
+            )
+            self._finalizada = True
+            self.entry.config(state="disabled")
+            self._atualizar_rank(self.tentativas, tempo)
+            self.root.after(900, self._mostrar_ranking)
+        else:
+            self._set_resultado(
+                f"🥳  {acertos} algarismo(s) certo(s), "
+                f"{posicoes} na posição correta.",
+                FG_MAIN,
+            )
+            self._log(
+                f"#{self.tentativas:<2} {texto}  ->  "
+                f"{acertos} algarismo(s), {posicoes} no lugar",
+                "miss",
+            )
+
+    def _desistir(self):
+        if self._finalizada:
+            return
+        self._finalizada = True
+        segredo = "".join(map(str, self.numero_secreto))
+        self._log(f"Você desistiu. Número secreto: {segredo}", "lose")
+        messagebox.showinfo(
+            "Desistiu", f"O número secreto era:  {segredo}", parent=self.root
+        )
+        self._mostrar_ranking()
+
+    # ---------------- Ranking ----------------
+    def _mostrar_ranking(self):
+        self._limpar()
+
+        outer, card = make_card(self.container)
+        outer.pack(fill="both", expand=True)
+
+        tk.Label(
+            card, text="🏆  Ranking",
+            fg=GOLD, bg=BG_CARD, font=("Segoe UI", 20, "bold"),
+        ).pack(pady=(28, 4))
+
+        tk.Label(
+            card,
+            text=f"Top {MAX_RANK} — mais difícil primeiro, depois tentativas e tempo",
+            fg=FG_MUTED, bg=BG_CARD, font=FONT_SUB,
+        ).pack(pady=(0, 20))
+
+        tk.Frame(card, bg=BORDER, height=1).pack(fill="x", padx=24)
+
+        lista = tk.Frame(card, bg=BG_CARD)
+        lista.pack(fill="both", expand=True, padx=32, pady=20)
+
+        if not self.rank:
+            tk.Label(
+                lista, text="Nenhuma pontuação registrada ainda.",
+                fg=FG_MUTED, bg=BG_CARD, font=("Segoe UI", 11, "italic"),
+            ).pack(pady=30)
+        else:
+            medalhas = ["🥇", "🥈", "🥉"]
+            for i, (nome, tent, tempo, dif) in enumerate(self.rank):
+                linha = tk.Frame(lista, bg=BG_CARD)
+                linha.pack(fill="x", pady=4)
+
+                tk.Label(
+                    linha,
+                    text=medalhas[i] if i < len(medalhas) else f"{i+1}º",
+                    fg=GOLD, bg=BG_CARD, font=("Segoe UI", 14),
+                    width=3, anchor="w",
+                ).pack(side="left")
+
+                tk.Label(
+                    linha, text=nome,
+                    fg=FG_MAIN, bg=BG_CARD,
+                    font=("Segoe UI", 12, "bold"), anchor="w",
+                ).pack(side="left", padx=(6, 0))
+
+                # badge da dificuldade
+                cor_badge = next(
+                    (c for n, _, c in DIFFICULTIES if n == dif), FG_MUTED
+                )
+                tk.Label(
+                    linha, text=f" {dif} ",
+                    fg="white", bg=cor_badge,
+                    font=("Segoe UI", 9, "bold"),
+                    padx=6, pady=1,
+                ).pack(side="left", padx=(10, 0))
+
+                tk.Label(
+                    linha,
+                    text=f"{tent} tentativa(s) · {tempo:.2f}s",
+                    fg=FG_MUTED, bg=BG_CARD, font=("Segoe UI", 10),
+                ).pack(side="right")
+
+        botoes = tk.Frame(card, bg=BG_CARD)
+        botoes.pack(pady=(0, 26))
+
+        make_button(
+            botoes, "↺  Jogar novamente",
+            self._iniciar_partida,
+            bg=ACCENT, hover_bg=ACCENT_HOV,
+        ).pack(side="left", padx=6)
+
+        make_button(
+            botoes, "🗑  Limpar ranking",
+            self._limpar_rank,
+            bg=DANGER, hover_bg=DANGER_HOV,
+        ).pack(side="left", padx=6)
+
+        make_button(
+            botoes, "Sair",
+            self.root.destroy,
+            bg="#21262d", hover_bg="#30363d",
+        ).pack(side="left", padx=6)
+
+    def _limpar_rank(self):
+        if not messagebox.askyesno(
+            "Confirmar", "Deseja realmente limpar o ranking?", parent=self.root
+        ):
+            return
+        self.rank = []
+        self._salvar_rank()
+        self._mostrar_ranking()
+
+
+if __name__ == "__main__":
+    Jogo()
