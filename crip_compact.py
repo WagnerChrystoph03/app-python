@@ -5,7 +5,7 @@ from tkinter import filedialog, messagebox, scrolledtext
 from cryptography.fernet import Fernet
 
 # ---------------- Configuração ----------------
-PASTA_CRIP    = os.environ.get("CRIPTO_PASTA", str(Path.home() / "Desktop" / "material crip"))
+PASTA_CRIP    = os.environ.get("CRIPTO_PASTA", str(Path.home() / "Desktop" / "seu_diretorio"))
 PASTA_DESCRIP = os.path.join(PASTA_CRIP, "descrip")
 KEY_FILE      = os.path.join(PASTA_CRIP, "chave.key")
 MARKER        = "ENCRYPTED_FILE_V1"
